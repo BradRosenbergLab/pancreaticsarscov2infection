@@ -1,0 +1,2429 @@
+---
+title: "Limited Extent and Consequences of Pancreatic SARS-CoV-2 Infection"
+author: "Verena van der Heide, Sonja Jangra, Phillip Cohen, Raveen Rathnasinghe, Teresa Aydillo-Gomez, Daniel Geanon, Diana Handler, Geoffrey Kelley, Brian Lee, Adeeb Rahman, Travis Dawson, Jingjing Qui, Darwin D’souza, Seunghee Kim-Schulze, Julia Panzer, Alejandro Caicedo, Irina Kusmartseva, Amanda Posgai, Mark Atkinson, Randy A. Albrecht, Adolfo García-Sastre, Brad R. Rosenberg, Michael Schotsaert & Dirk Homann"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: TRUE
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  echo = TRUE,
+  comment = "#>",
+  fig.path = "../figures/",
+  dpi = 300
+)
+```
+
+## Load R Libraries
+```{r}
+library(renv)
+library(hdf5r)
+library(Seurat)
+library(paletteer)
+library(tidyverse)
+library(here)
+library(mgsub)
+library(patchwork)
+library(pheatmap)
+library(SeuratData)
+library(ggpubr)
+library(edgeR)
+library(scran)
+library(scuttle)
+library(org.Hs.eg.db)
+library(openxlsx)
+library(msigdbr)
+library(styler)
+library(future)
+library(future.apply)
+library(BiocManager)
+library(multtest)
+library(GO.db)
+library(metap)
+source(here("analysis/paper/functions.R"))
+```
+
+## Prepare Color Palettes
+```{r}
+Infection_State_Palette <- c(palettes_d$ggsci$nrc_npg, palettes_d$ggsci$planetexpress_futurama)[c(3, 4, 10, 11)]
+names(Infection_State_Palette) <- c("Mock", "Bystander", "Not Assigned", "Infected")
+
+Cell_Type_Palette <- c(
+  alpha = "#00abac",
+  beta = "#9b2dcc",
+  gamma = "#0533ff",
+  delta = "#3e7f00",
+  acinar = "#d6d300",
+  ductal = "#00fdff",
+  endothelial = "#ff2600",
+  activated_stellate = "#BA6338",
+  quiescent_stellate = "#6BD76B",
+  mast = "#D595A7",
+  schwann = "#924822",
+  macrophage = "#837B8D"
+)
+
+Sample_Palette <- palettes_d$ggsci$schwifty_rickandmorty[1:6]
+names(Sample_Palette) <- c(
+  paste("Infect", seq(3), sep = "_"),
+  paste("Mock", seq(3), sep = "_")
+)
+
+Donor_Palette <- c(palettes_d$ggsci$nrc_npg, palettes_d$ghibli$MononokeMedium, palettes_d$ghibli$PonyoLight)[c(2, 15, 23)]
+names(Donor_Palette) <- paste("Donor", seq(3), sep = "_")
+
+Condition_Palette <- palettes_d$wesanderson$Chevalier1[1:2]
+names(Condition_Palette) <- c("SARS-CoV-2", "Mock")
+```
+
+## Import Cellranger Output
+```{r}
+### Point to h5 files on local system
+data_files <- list.files(
+  path = here("analysis/data/raw_data/CellRanger_h5"),
+  pattern = ".h5$", full.names = TRUE, recursive = TRUE
+)
+names(data_files) <- list.files(
+  path = here("analysis/data/raw_data/CellRanger_h5"),
+  pattern = ".h5$", full.names = FALSE, recursive = TRUE
+) %>%
+  str_remove(pattern = "raw_feature_bc_matrix.h5") %>%
+  str_remove(pattern = "\\/")
+
+### Load 10X h5 files
+Pancreas_BRR <- lapply(data_files, Read10X_h5)
+```
+
+## Match Sample ID with Original Objects
+```{r}
+sample_labels <- data.frame(
+  f_name = c(
+    "DIHO05_8_21_0_v1", "DIHO05_Dirk_0_v1", "DIHO05_P2_0_v1",
+    "DIHO05_mock_0_v1", "DIHO05_neg_0_v1", "DIHO05_pos_0_v1"
+  ),
+  sample = c(
+    "Infect_2", "Mock_2", "Infect_3",
+    "Mock_3", "Mock_1", "Infect_1"
+  )
+)
+
+names(Pancreas_BRR) <- mgsub(names(Pancreas_BRR),
+  pattern = paste0("count_", sample_labels$f_name),
+  replacement = sample_labels$sample
+)
+```
+
+## Create Seurat Objects and Add Metadata
+```{r}
+### Prepare viral genes vector
+viral_genes <- c("gRNA", "S", "ORF3a", "E", "M", "ORF6", "ORF7a", "ORF7b", "ORF8", "N")
+
+### Prepare host genes vector
+host_genes <- rownames(Pancreas_BRR$Infect_2)[!rownames(Pancreas_BRR$Infect_2) %in% viral_genes]
+
+### Create Seurat Objects
+#### All Cells must have at least 10 genes expressed
+Pancreas_BRR <- lapply(Pancreas_BRR,
+  CreateSeuratObject,
+  project = "SARSCoV2_Pancreas",
+  min.features = 10
+)
+
+### Calculate Percent of Gene Expression Derived from Mitochondrial Genes
+Pancreas_BRR <- lapply(Pancreas_BRR,
+  PercentageFeatureSet,
+  pattern = "^MT-",
+  col.name = "percent_mito"
+)
+
+### Calculate total host and viral UMIs per cell
+Pancreas_BRR <- lapply(Pancreas_BRR, calculate_viral_nUMIs)
+Pancreas_BRR <- lapply(Pancreas_BRR, calculate_host_nUMIs)
+
+### Calculate number of host and viral genes detected per cell
+Pancreas_BRR <- lapply(Pancreas_BRR, calculate_viral_nFeatures)
+Pancreas_BRR <- lapply(Pancreas_BRR, calculate_host_nFeatures)
+
+### Add cell barcode to metadata
+Pancreas_BRR <- lapply(Pancreas_BRR, add_cell_barcodes)
+
+### Calculate percent of gene expression due to SARS-CoV-2
+Pancreas_BRR <- lapply(Pancreas_BRR, PercentageFeatureSet,
+  features = viral_genes,
+  col.name = "percent_viral",
+  assay = "RNA"
+)
+
+### Add Mount Sinai Human Immune Monitoring Core Sample Name
+Pancreas_BRR$Infect_1$Sample <- "Infect_1"
+Pancreas_BRR$Infect_2$Sample <- "Infect_2"
+Pancreas_BRR$Infect_3$Sample <- "Infect_3"
+
+Pancreas_BRR$Mock_1$Sample <- "Mock_1"
+Pancreas_BRR$Mock_2$Sample <- "Mock_2"
+Pancreas_BRR$Mock_3$Sample <- "Mock_3"
+
+### Add Donor
+Pancreas_BRR$Infect_1$Donor <- "Donor_1"
+Pancreas_BRR$Infect_2$Donor <- "Donor_2"
+Pancreas_BRR$Infect_3$Donor <- "Donor_3"
+
+Pancreas_BRR$Mock_1$Donor <- "Donor_1"
+Pancreas_BRR$Mock_2$Donor <- "Donor_2"
+Pancreas_BRR$Mock_3$Donor <- "Donor_3"
+```
+
+## Filter Cells by QC Metrics
+
+Because samples were run on separate lanes of the 10X Chromium Controller (and therefore prepared separately), we will examine the QC output separately per library. Using these metrics we will filter out putative doublets, empty droplets, and dead cells.
+
+### Plot QC Metrics
+```{r}
+for (sample in names(Pancreas_BRR)) {
+  violins <- VlnPlot(Pancreas_BRR[[sample]],
+    features = c("nCount_RNA", "nFeature_RNA", "percent_mito"),
+    combine = FALSE
+  )
+  violins <- lapply(violins, function(x) {
+    x <- x + theme(
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.position = "none"
+    )
+    return(x)
+  })
+  violins <- CombinePlots(violins, ncol = 3)
+  plot_1 <- FeatureScatter(Pancreas_BRR[[sample]],
+    feature1 = "nCount_RNA",
+    feature2 = "nFeature_RNA"
+  ) +
+    NoLegend()
+  plot_2 <- FeatureScatter(Pancreas_BRR[[sample]],
+    feature1 = "nCount_RNA",
+    feature2 = "percent_mito"
+  ) +
+    NoLegend()
+  print(wrap_elements(text_grob(label = sample)) /
+    violins /
+    CombinePlots(list(plot_1, plot_2), ncol = 2) +
+    plot_layout(heights = c(1, 5, 5)))
+}
+```
+Based on the above plots, the following filtering parameters per sample appear to best identify live, single cells. 
+
+**Infect_2**
+nCount_RNA < 15000 & > 2000
+nFeature_RNA < 3500 & > 100
+percent_mito < 10
+
+**Mock_2**
+nCount_RNA < 15000 & > 2000
+nFeature_RNA < 3500 & > 100
+percent_mito < 10
+
+**Mock_3**
+nCount_RNA < 40000 & > 3000
+nFeature_RNA < 6000 & > 100
+percent_mito < 12.5
+
+**Mock_1**
+nCount_RNA < 15000 & 3000
+nFeature_RNA < 4000 & > 100
+percent_mito < 15
+
+**Infect_3**
+nCount_RNA  < 40000 & > 3000
+nFeature_RNA > 10 & < 6000
+percent_mito < 15
+
+
+**Infect_1**
+nCount_RNA > 1000 & < 25000
+nFeature_RNA > 10 & < 5000
+percent_mito < 10
+
+### Filter Cells
+
+Filter cells according to the parameters identified above.
+```{r}
+Pancreas_BRR_Filtered <- Pancreas_BRR
+
+#### Infect_2
+Pancreas_BRR_Filtered$Infect_2 <- subset(
+  Pancreas_BRR_Filtered$Infect_2,
+  nCount_RNA < 15000 & nCount_RNA > 2000 &
+    nFeature_RNA > 100 & nFeature_RNA < 3500 &
+    percent_mito < 10
+)
+
+#### Mock_2
+Pancreas_BRR_Filtered$Mock_2 <- subset(
+  Pancreas_BRR_Filtered$Mock_2,
+  nCount_RNA < 15000 & nCount_RNA > 2000 &
+    nFeature_RNA > 100 & nFeature_RNA < 3500 &
+    percent_mito < 10
+)
+
+#### Mock_3
+Pancreas_BRR_Filtered$Mock_3 <- subset(
+  Pancreas_BRR_Filtered$Mock_3,
+  nCount_RNA < 40000 & nCount_RNA > 3000 &
+    nFeature_RNA > 100 & nFeature_RNA < 6000 &
+    percent_mito < 12.5
+)
+
+#### Mock_1
+Pancreas_BRR_Filtered$Mock_1 <- subset(
+  Pancreas_BRR_Filtered$Mock_1,
+  nCount_RNA < 15000 & nCount_RNA > 3000 &
+    nFeature_RNA > 100 & nFeature_RNA < 4000 &
+    percent_mito < 15
+)
+
+#### Infect_3
+Pancreas_BRR_Filtered$Infect_3 <- subset(
+  Pancreas_BRR_Filtered$Infect_3,
+  nCount_RNA < 40000 & nCount_RNA > 3000 &
+    nFeature_RNA > 10 & nFeature_RNA < 6000 &
+    percent_mito < 15
+)
+
+#### Infect_1
+Pancreas_BRR_Filtered$Infect_1 <- subset(
+  Pancreas_BRR_Filtered$Infect_1,
+  nCount_RNA > 3000 & nCount_RNA < 25000 &
+    nFeature_RNA > 10 & nFeature_RNA < 5000 &
+    percent_mito < 10
+)
+```
+
+### Plot QC Metrics After Filtering
+
+Examine QC metrics after filtering to check that the distribution of parameters is uniform within a library, suggesting that we have selected only single, live cells.
+```{r fig.width = 10, fig.height = 5}
+for (sample in names(Pancreas_BRR_Filtered)) {
+  violins <- VlnPlot(Pancreas_BRR_Filtered[[sample]],
+    features = c("nCount_RNA", "nFeature_RNA", "percent_mito"),
+    combine = FALSE
+  )
+  violins <- lapply(violins, function(x) {
+    x <- x + theme(
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.position = "none"
+    )
+    return(x)
+  })
+  violins <- CombinePlots(violins, ncol = 3)
+  plot_1 <- FeatureScatter(Pancreas_BRR_Filtered[[sample]],
+    feature1 = "nCount_RNA",
+    feature2 = "nFeature_RNA"
+  ) +
+    NoLegend()
+  plot_2 <- FeatureScatter(Pancreas_BRR_Filtered[[sample]],
+    feature1 = "nCount_RNA",
+    feature2 = "percent_mito"
+  ) +
+    NoLegend()
+  print(wrap_elements(text_grob(label = sample)) /
+    violins /
+    CombinePlots(list(plot_1, plot_2), ncol = 2) +
+    plot_layout(heights = c(1, 5, 5)))
+}
+rm(list = c("plot_1", "plot_2", "violins"))
+```
+
+### Apply filtering
+
+Apply the filtering to the original object and remove the filter test object
+```{r}
+Pancreas_BRR <- Pancreas_BRR_Filtered
+rm(Pancreas_BRR_Filtered)
+```
+
+## SCTransform data
+```{r}
+Pancreas_BRR <- lapply(Pancreas_BRR, SCTransform,
+  vars.to.regress = c("percent_mito"),
+  verbose = FALSE
+)
+```
+
+## Transfer Pancreas Data Labels to Annotate Cell Types
+
+Perform label transfer from Seurat pancreas scRNAseq data
+Data sources for panc8 object:
+1.Baron, M. et al. A Single-Cell Transcriptomic Map of the Human and Mouse Pancreas Reveals Inter- and Intra-cell Population Structure. Cell Systems 3, 346-360.e4 (2016).
+2.Grün, D. et al. De Novo Prediction of Stem Cell Identity using Single-Cell Transcriptome Data. Cell Stem Cell 19, 266–277 (2016).
+3.Lawlor, N. et al. Single-cell transcriptomes identify human islet cell signatures and reveal cell-type–specific expression changes in type 2 diabetes. Genome Res. 27, 208–222 (2017).
+4.Muraro, M. J. et al. A Single-Cell Transcriptome Atlas of the Human Pancreas. Cell Systems 3, 385-394.e3 (2016).
+5.Segerstolpe, Å. et al. Single-Cell Transcriptome Profiling of Human Pancreatic Islets in Health and Type 2 Diabetes. Cell Metabolism 24, 593–607 (2016).
+6.Stuart, T. et al. Comprehensive integration of single-cell data. Cell 177, 1888-1902.e21 (2019).
+```{r}
+### Load Seurat pancreas scRNAseq data
+InstallData("panc8")
+data("panc8")
+
+## Prepare for label transfer
+### Use SCTransform to normalize data and find variable features in datasets
+panc8 <- SCTransform(panc8,
+  verbose = FALSE
+)
+
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 2500 * 1024^2)
+Pancreas_BRR <- future_lapply(Pancreas_BRR, function(x) {
+  ### Identify transfer anchors
+  pancreas.anchors <- FindTransferAnchors(
+    reference = panc8,
+    query = x,
+    dims = 1:30
+  )
+
+  ### Transfer cell type label
+  predictions <- TransferData(
+    anchorset = pancreas.anchors,
+    refdata = panc8$celltype,
+    dims = 1:30
+  )
+
+  ### Add predicted cell type to query object
+  x <- AddMetaData(x,
+    metadata = predictions
+  )
+
+  return(x)
+})
+
+rm("panc8")
+```
+
+## Classify Infected Cells By Dataset
+
+We will classify infected cells by clustering cells based on SARS-CoV-2 sgmRNA expression using k-medoids clustering as implemented by the pam algorithm described in our preprint (Cohen et al, bioRxiv 2021 https://www.biorxiv.org/content/10.1101/2021.11.22.469642v1). In this dataset we set k=3 to separate cells with high levels of viral RNA, low levels of viral RNA, and intermediate levels of viral RNA. Cells in the cluster with high levels of viral RNA are classified as infected while cells in the cluster with low levels of viral RNA are classified as uninfected or bystander cells. Setting k = 3 allows us to identify cells with intermediate levels of viral RNA, which could be cells early in infection, cells with abortive infection, or uninfected cells with high levels of ambient viral RNA. We therefore classify these cells as "Not Assigned" and exclude them when performing DE testing between infected and bystander cells to allow for a more clear delineation between infected and uninfected cells. 
+```{r}
+### Normalize RNA Data prior to infection classification
+Pancreas_BRR <- lapply(Pancreas_BRR,
+  NormalizeData,
+  assay = "RNA",
+  normalization.method = "LogNormalize",
+  verbose = FALSE
+)
+
+### Scale RNA Data prior to infection classification
+Pancreas_BRR <- lapply(Pancreas_BRR,
+  ScaleData,
+  assay = "RNA",
+  verbose = FALSE
+)
+
+### Set seed
+set.seed(1234)
+
+### Classify infected cells
+Pancreas_BRR$Infect_1 <- classify_infection_status_k_medoid(
+  Seurat_Obj = Pancreas_BRR$Infect_1, k = 3
+)
+Pancreas_BRR$Infect_2 <- classify_infection_status_k_medoid(
+  Seurat_Obj = Pancreas_BRR$Infect_2, k = 3
+)
+Pancreas_BRR$Infect_3 <- classify_infection_status_k_medoid(
+  Seurat_Obj = Pancreas_BRR$Infect_3, k = 3
+)
+
+### Set infection classification to "Mock" for mock conditions
+Pancreas_BRR$Mock_1$Infection_Classification_K_Medoid_3 <- "Mock"
+Pancreas_BRR$Mock_2$Infection_Classification_K_Medoid_3 <- "Mock"
+Pancreas_BRR$Mock_3$Infection_Classification_K_Medoid_3 <- "Mock"
+
+### Plot Viral Genes by Infection Classification to Classify Clusters
+VlnPlot(Pancreas_BRR$Infect_1,
+  features = c(viral_genes, "nCount_Viral", "nFeature_Viral"),
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+VlnPlot(Pancreas_BRR$Infect_2,
+  features = c(viral_genes, "nCount_Viral", "nFeature_Viral"),
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+VlnPlot(Pancreas_BRR$Infect_3,
+  features = c(viral_genes, "nCount_Viral", "nFeature_Viral"),
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+
+DoHeatmap(Pancreas_BRR$Infect_1,
+  features = viral_genes,
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+DoHeatmap(Pancreas_BRR$Infect_2,
+  features = viral_genes,
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+DoHeatmap(Pancreas_BRR$Infect_3,
+  features = viral_genes,
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+```
+Using the expression of viral genes per cell per cluster, identify clusters that are infected or Bystander
+
+## Label Infected Clusters
+```{r}
+Pancreas_BRR$Infect_1$Infection_Classification_K_Medoid_3 <- mgsub(
+  string = Pancreas_BRR$Infect_1$Infection_Classification_K_Medoid_3,
+  pattern = seq(3),
+  replacement = c("Infected", "Bystander", "Not Assigned")
+)
+Pancreas_BRR$Infect_2$Infection_Classification_K_Medoid_3 <- mgsub(
+  string = Pancreas_BRR$Infect_2$Infection_Classification_K_Medoid_3,
+  pattern = seq(3),
+  replacement = c("Bystander", "Not Assigned", "Infected")
+)
+
+Pancreas_BRR$Infect_3$Infection_Classification_K_Medoid_3 <- mgsub(
+  string = Pancreas_BRR$Infect_3$Infection_Classification_K_Medoid_3,
+  pattern = seq(3),
+  replacement = c("Not Assigned", "Bystander", "Infected")
+)
+
+### Plot Viral Gene Expression of Labelled Infection Clusters
+VlnPlot(Pancreas_BRR$Infect_1,
+  features = c("nCount_Viral", "nFeature_Viral"),
+  group.by = "Infection_Classification_K_Medoid_3",
+  cols = Infection_State_Palette
+)
+VlnPlot(Pancreas_BRR$Infect_2,
+  features = c("nCount_Viral", "nFeature_Viral"),
+  group.by = "Infection_Classification_K_Medoid_3",
+  cols = Infection_State_Palette
+)
+VlnPlot(Pancreas_BRR$Infect_3,
+  features = c("nCount_Viral", "nFeature_Viral"),
+  group.by = "Infection_Classification_K_Medoid_3",
+  cols = Infection_State_Palette
+)
+
+DoHeatmap(Pancreas_BRR$Infect_1,
+  features = viral_genes,
+  group.colors = Infection_State_Palette,
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+DoHeatmap(Pancreas_BRR$Infect_2,
+  features = viral_genes,
+  group.colors = Infection_State_Palette,
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+DoHeatmap(Pancreas_BRR$Infect_3,
+  features = viral_genes,
+  group.colors = Infection_State_Palette,
+  group.by = "Infection_Classification_K_Medoid_3"
+)
+```
+
+## Add Viral Gene Detection Cutoff to Infection Classification
+```{r}
+### Define confidently infected cells are classified as infected by k-medoids classifier and have at least 5 viral genes expressed
+Pancreas_BRR <- lapply(Pancreas_BRR, function(x) {
+  x$Confident_Infection_Classification <- ifelse(x$Infection_Classification_K_Medoid_3 == "Infected" &
+    x$nFeature_Viral > 5,
+  "Confident_Infected",
+  x$Infection_Classification_K_Medoid_3
+  )
+  x$Confident_Infection_Classification <- mgsub(
+    string = x$Confident_Infection_Classification,
+    pattern = c(
+      "Confident_Infected",
+      "Infected"
+    ),
+    replacement = c(
+      "Infected",
+      "Not Assigned"
+    )
+  )
+  x$Confident_Infection_Classification <- factor(x$Confident_Infection_Classification,
+    levels = c(
+      "Mock",
+      "Bystander",
+      "Not Assigned",
+      "Infected"
+    )
+  )
+  return(x)
+})
+
+### Plot viral gene expression by confident infection classification
+VlnPlot(Pancreas_BRR$Infect_1,
+  features = c("nCount_Viral", "nFeature_Viral"),
+  group.by = "Confident_Infection_Classification",
+  cols = Infection_State_Palette,
+  split.by = "Sample"
+)
+VlnPlot(Pancreas_BRR$Infect_2,
+  features = c("nCount_Viral", "nFeature_Viral"),
+  group.by = "Confident_Infection_Classification",
+  cols = Infection_State_Palette,
+  split.by = "Sample"
+)
+VlnPlot(Pancreas_BRR$Infect_3,
+  features = c("nCount_Viral", "nFeature_Viral"),
+  group.by = "Confident_Infection_Classification",
+  cols = Infection_State_Palette,
+  split.by = "Sample"
+)
+DoHeatmap(Pancreas_BRR$Infect_1,
+  features = viral_genes,
+  group.colors = Infection_State_Palette,
+  group.by = "Confident_Infection_Classification"
+)
+DoHeatmap(Pancreas_BRR$Infect_2,
+  features = viral_genes,
+  group.colors = Infection_State_Palette,
+  group.by = "Confident_Infection_Classification"
+)
+DoHeatmap(Pancreas_BRR$Infect_3,
+  features = viral_genes,
+  group.colors = Infection_State_Palette,
+  group.by = "Confident_Infection_Classification"
+)
+
+### Calculate percent of cells infected in each sample
+prop.table(table(Pancreas_BRR$Infect_1$Confident_Infection_Classification))
+prop.table(table(Pancreas_BRR$Infect_2$Confident_Infection_Classification))
+prop.table(table(Pancreas_BRR$Infect_3$Confident_Infection_Classification))
+```
+
+## Integrate Data
+```{r message = FALSE, error = FALSE, warning = FALSE}
+## Remove RNA Scale Data slot to decrease object size and memory footprint
+Pancreas_BRR <- lapply(Pancreas_BRR, function(x) {
+  x@assays$RNA@scale.data <- new(Class = "matrix")
+  return(x)
+})
+
+### Select features for integration
+features <- SelectIntegrationFeatures(object.list = Pancreas_BRR, nfeatures = 2000)
+
+### Prep SCTransformed object for Integration
+options(future.globals.maxSize = 3000 * 1024^2)
+Pancreas_BRR <- PrepSCTIntegration(
+  object.list = Pancreas_BRR,
+  anchor.features = features
+)
+
+### Perform PCA on each dataset using integration features
+Pancreas_BRR <- lapply(Pancreas_BRR, function(x) {
+  x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+### Find anchors using reciprocal PCA and mock samples as references
+anchors <- FindIntegrationAnchors(
+  object.list = Pancreas_BRR,
+  normalization.method = "SCT",
+  anchor.features = features,
+  dims = 1:30,
+  reference = grep(names(Pancreas_BRR), pattern = "^Mock_"),
+  reduction = "rpca",
+  k.anchor = 20
+)
+
+### Increase memory available for integration
+options(future.globals.maxSize = 3600 * 1024^2)
+plan("sequential")
+
+### Integrate objects
+Pancreas_BRR <- IntegrateData(
+  anchorset = anchors,
+  verbose = FALSE
+)
+
+### Delete the anchor object
+rm(anchors)
+
+### Set infection classification as factor and set levels
+Pancreas_BRR$Confident_Infection_Classification <- factor(Pancreas_BRR$Confident_Infection_Classification,
+  levels = c("Mock", "Bystander", "Not Assigned", "Infected")
+)
+
+### Set predicted cell type as factor and set levels
+Pancreas_BRR$predicted.id <- factor(Pancreas_BRR$predicted.id,
+  levels = c(
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "acinar",
+    "ductal",
+    "endothelial",
+    "activated_stellate",
+    "quiescent_stellate",
+    "mast",
+    "schwann",
+    "macrophage"
+  )
+)
+```
+
+## Explore Prediction Score by Cell Type ID and Infection_State
+```{r}
+Prediction_Scores <- FetchData(Pancreas_BRR,
+  vars = c(
+    "Confident_Infection_Classification",
+    "predicted.id",
+    "prediction.score.max"
+  )
+)
+
+ggplot(Prediction_Scores, aes(
+  x = predicted.id,
+  y = prediction.score.max,
+  fill = Confident_Infection_Classification,
+  color = Confident_Infection_Classification
+)) +
+  geom_boxplot(
+    position = "dodge",
+    color = "black",
+    outlier.shape = NA
+  ) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  labs(y = "Max Prediction Score", x = element_blank(), fill = "Infection Classification") +
+  theme_classic() +
+  theme(
+    text = element_text(family = "Helvetica"),
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave(
+  filename = here("analysis/figures/Figure_S4_prediction_scores.pdf"),
+  width = 8, height = 4
+)
+```
+
+## Add Metadata to Integrated Object
+```{r}
+### Set factor levels for Sample & Donor
+Pancreas_BRR$Sample <- factor(Pancreas_BRR$Sample,
+  levels = c(
+    "Mock_1", "Infect_1",
+    "Mock_2", "Infect_2",
+    "Mock_3", "Infect_3"
+  )
+)
+
+Pancreas_BRR$Donor <- factor(Pancreas_BRR$Donor,
+  levels = c(
+    "Donor_1",
+    "Donor_2",
+    "Donor_3"
+  )
+)
+
+Pancreas_BRR$Condition <- str_remove(
+  string = Pancreas_BRR$Sample,
+  pattern = "_."
+)
+Pancreas_BRR$Condition <- str_replace(
+  string = Pancreas_BRR$Condition,
+  pattern = "Infect",
+  replacement = "SARS-CoV-2"
+)
+```
+
+## General Overview of Sample Libraries
+```{r}
+Library_Overview <- FetchData(Pancreas_BRR,
+  vars = c(
+    "nCount_Host",
+    "nFeature_Host",
+    "percent_viral",
+    "Donor",
+    "Confident_Infection_Classification"
+  )
+)
+
+### Reformat Donor name
+Library_Overview$Donor <- str_replace(
+  string = Library_Overview$Donor,
+  pattern = "_",
+  replacement = " "
+)
+
+### Set order for infection states
+Library_Overview$Confident_Infection_Classification <- factor(Library_Overview$Confident_Infection_Classification,
+  levels = c("Mock", "Bystander", "Not Assigned", "Infected")
+)
+
+### Revert percent values to decimals
+Library_Overview$percent_viral <- Library_Overview$percent_viral * 0.01
+plot_1 <- ggplot(
+  Library_Overview,
+  aes(
+    x = Confident_Infection_Classification,
+    y = nCount_Host,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  scale_y_log10() +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = "Host UMIs/Cell"
+  ) +
+  theme(
+    text = element_text(family = "Helvetica"),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_text(hjust = 0.5, size = 10),
+    legend.position = "none",
+    strip.background = element_blank()
+  ) +
+  stat_compare_means(
+    method = "wilcox.test",
+    comparisons = list(
+      c("Infected", "Bystander"),
+      c("Infected", "Mock")
+    ),
+    method.args = list(alternative = "less"),
+    hide.ns = FALSE,
+    label = "p.signif"
+  )
+
+plot_2 <- ggplot(
+  Library_Overview,
+  aes(
+    x = Confident_Infection_Classification,
+    y = nFeature_Host,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  scale_y_log10() +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = "Host Genes/Cell"
+  ) +
+  theme(
+    text = element_text(family = "Helvetica"),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_text(hjust = 0.5, size = 10),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none"
+  ) +
+  stat_compare_means(
+    method = "wilcox.test",
+    comparisons = list(
+      c("Infected", "Bystander"),
+      c("Infected", "Mock")
+    ),
+    method.args = list(alternative = "less"),
+    hide.ns = FALSE,
+    label = "p.signif"
+  )
+
+plot_3 <- ggplot(
+  Library_Overview,
+  aes(
+    x = Confident_Infection_Classification,
+    y = percent_viral,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = "Percent\nViral Gene Expression"
+  ) +
+  theme(
+    text = element_text(family = "Helvetica"),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_text(hjust = 0.5, size = 10),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none"
+  )
+
+
+plot_1 / plot_2 / plot_3
+ggsave(
+  filename = here("analysis/figures/Figure_S3_C_Library_Overview_NoLegend.pdf"),
+  width = 3.75, height = 4.5
+)
+```
+
+
+## Viral Gene Expression by Infection Status
+```{r}
+plot_1 <- VlnPlot(Pancreas_BRR,
+  features = c("nFeature_Viral"),
+  group.by = "Donor",
+  split.by = "Confident_Infection_Classification",
+  pt.size = 0,
+  cols = Infection_State_Palette
+) +
+  ggtitle("Number of Viral Genes Detected")
+plot_2 <- VlnPlot(Pancreas_BRR,
+  features = c("nCount_Viral"),
+  log = TRUE,
+  group.by = "Donor",
+  split.by = "Confident_Infection_Classification",
+  pt.size = 0,
+  cols = Infection_State_Palette
+) +
+  ggtitle("Number of Viral UMIs Detected")
+
+plot_3 <- VlnPlot(Pancreas_BRR,
+  features = c("percent_viral"),
+  log = FALSE,
+  group.by = "Donor",
+  split.by = "Confident_Infection_Classification",
+  pt.size = 0,
+  cols = Infection_State_Palette
+) +
+  ggtitle("Percent of Cell Transcriptome from SARS-CoV-2")
+
+plot_1 / plot_2 / plot_3 + plot_layout(guides = "collect")
+
+VlnPlot(subset(Pancreas_BRR, Confident_Infection_Classification == "Infected"), features = c("nCount_Viral", "percent_viral", "nCount_RNA", "nCount_Host"), group.by = "predicted.id")
+```
+
+## Reduce Dimension with UMAP for Visualization
+```{r}
+### Set default assay to integrated
+DefaultAssay(Pancreas_BRR) <- "integrated"
+
+### Scale Integrated Data
+Pancreas_BRR <- ScaleData(Pancreas_BRR, verbose = FALSE)
+
+### Perform PCA with integrated data
+Pancreas_BRR <- RunPCA(Pancreas_BRR, verbose = FALSE)
+
+### Visualize PCs to determine optimal selection for UMAP
+DimHeatmap(Pancreas_BRR, dims = 1:4, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 5:8, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 9:12, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 13:16, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 17:20, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 21:24, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 25:28, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 29:32, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 33:36, balanced = TRUE)
+DimHeatmap(Pancreas_BRR, dims = 37:40, balanced = TRUE)
+```
+PCs 1 through 29 contain noticeable structure and will be used for UMAP.
+
+### Perform UMAP dimensional reduction
+```{r}
+Pancreas_BRR <- RunUMAP(Pancreas_BRR,
+  reduction = "pca",
+  dims = 1:29,
+  verbose = FALSE
+)
+```
+
+## Visualize Cell Type, Integration, and Infection State
+```{r}
+plot_1 <- DimPlot(Pancreas_BRR,
+  group.by = "predicted.id",
+  cols = Cell_Type_Palette,
+  shuffle = TRUE,
+  seed = 123,
+  pt.size = 0.01,
+  label = TRUE
+) + coord_equal() +
+  ggtitle("Cell Type") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 8),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom"
+  )
+
+plot_2 <- DimPlot(Pancreas_BRR,
+  group.by = "Condition",
+  cols = Condition_Palette,
+  shuffle = TRUE,
+  pt.size = 0.01,
+  seed = 123
+) + coord_equal() +
+  ggtitle("Experimental\nCondition") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 8),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom"
+  )
+
+plot_3 <- DimPlot(Pancreas_BRR,
+  group.by = "Donor",
+  cols = Donor_Palette,
+  shuffle = TRUE,
+  pt.size = 0.01,
+  seed = 123
+) + coord_equal() +
+  ggtitle("Donor") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 8),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom"
+  )
+
+plot_4 <- DimPlot(Pancreas_BRR,
+  group.by = "Confident_Infection_Classification",
+  cols = Infection_State_Palette,
+  shuffle = TRUE,
+  order = c("Infected", "Bystander", "Mock", "Not Assigned"),
+  pt.size = 0.01,
+  seed = 123
+) + coord_equal() +
+  ggtitle("Assigned\nInfection\nState") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 8),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom"
+  )
+
+### Save legends
+as_ggplot(get_legend(plot_1)) /
+  as_ggplot(get_legend(plot_2)) /
+  as_ggplot(get_legend(plot_3)) /
+  as_ggplot(get_legend(plot_4))
+ggsave(filename = here("analysis/figures/Figure_3A_UMAP_Legends.pdf"))
+
+### Remove legends
+plot_1 <- plot_1 + NoLegend()
+plot_2 <- plot_2 + NoLegend()
+plot_3 <- plot_3 + NoLegend()
+plot_4 <- plot_4 + NoLegend()
+
+(plot_1 / plot_4)
+ggsave(
+  filename = here("analysis/figures/Figure_3A_UMAPs.pdf"),
+  width = 3.5, height = 7
+)
+
+plot_1 <- DimPlot(Pancreas_BRR,
+  group.by = "predicted.id",
+  cols = Cell_Type_Palette,
+  shuffle = TRUE,
+  seed = 123,
+  pt.size = 0.01,
+  label = FALSE
+) + coord_equal() +
+  ggtitle("Cell Type") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 8),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "bottom"
+  ) + NoLegend()
+
+(plot_1 | plot_2 | plot_3 | plot_4)
+ggsave(
+  filename = here("analysis/figures/Figure_S3A_UMAPs.pdf"),
+  width = 16, height = 4
+)
+
+### Plot QC Metrics on UMAP
+FeaturePlot(Pancreas_BRR,
+  features = c(
+    "nCount_Host", "nFeature_Host",
+    "nCount_Viral", "nFeature_Viral",
+    "nCount_RNA", "nFeature_RNA"
+  ),
+  max.cutoff = "q95",
+  cols = c("grey75", "firebrick4")
+)
+```
+
+## Cell Types by Sample
+```{r}
+### Prepare data to make stacked bar plot
+### Fetch cell type, and sample data
+Cell_Type_By_Sample <- FetchData(Pancreas_BRR, vars = c(
+  "predicted.id",
+  "Condition",
+  "Donor"
+))
+
+### Count the number of cells per infection state per cell type and per sample
+Cell_Type_By_Sample <- group_by(Cell_Type_By_Sample, predicted.id, Condition, Donor) %>% tally()
+
+### Count the total number of cells per sample
+Cell_Type_By_Sample <- Cell_Type_By_Sample %>%
+  group_by(Donor, Condition) %>%
+  mutate(Total_Cells = sum(n))
+
+### Plot the distribution of cell types by sample
+ggplot(Cell_Type_By_Sample, aes(x = Condition, y = n, fill = predicted.id)) +
+  geom_col(position = "fill") +
+  geom_text(
+    y = 1.02,
+    size = 3.5,
+    aes(label = Total_Cells)
+  ) +
+  scale_fill_manual(values = Cell_Type_Palette) +
+  facet_grid(cols = vars(Donor)) +
+  labs(x = "Sample", y = "Distribution of Cell Types per Sample", fill = "Cell Type") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+  )
+ggsave(
+  filename = here("analysis/figures/Figure_3B_Cell_Type_Distribution_by_Sample.pdf"),
+  width = 4.75, height = 2.875
+)
+
+### Calculate the percent of each sample derived from each cell type
+Cell_Type_By_Sample$Fraction_Cell_Type <- Cell_Type_By_Sample$n / Cell_Type_By_Sample$Total_Cells
+
+### Make a vector of cell types present in all samples
+celltypes <- as.data.frame(table(Pancreas_BRR$predicted.id, Pancreas_BRR$Sample)) %>%
+  pivot_wider(names_from = Var2, values_from = Freq) %>%
+  as.data.frame() %>%
+  subset(Mock_1 > 1 & Infect_1 > 1 & Mock_2 > 1 & Infect_2 > 1 & Mock_3 > 1 & Infect_3 > 1) %>%
+  pull(Var1) %>%
+  as.character()
+
+### Make a vector of donors
+donors <- paste("Donor", 1:3, sep = "_")
+
+### Test for difference in the fraction of a sample derived from a single cell type per sample using
+### a paired t-test (paired by donor)
+for (celltype in celltypes) {
+  #### Subset to cell type of interest
+  data_to_test <- subset(
+    Cell_Type_By_Sample,
+    predicted.id == celltype
+  ) %>%
+    pivot_wider(
+      names_from = Condition,
+      values_from = Fraction_Cell_Type,
+      id_cols = Donor
+    )
+  ### Per donor
+  output <- t.test(x = data_to_test$Mock, y = data_to_test$`SARS-CoV-2`, paired = TRUE)
+  ### Output the p value of the test
+  p_value <- output$p.value
+  print(celltype)
+  print(p_value)
+}
+```
+Based on the t-test comparing changes in frequency of a given cell type with and without infection per donor, there are no significant differences in cell type induced by infection. 
+
+## Infection Classification by Cell Type
+```{r}
+### Examine only the infected samples from our merged data object
+Infected_Only <- subset(Pancreas_BRR, Condition == "SARS-CoV-2")
+
+### Fetch infection classification, cell type, and sample data
+Infection_by_predicted.id <- FetchData(Infected_Only,
+  vars = c(
+    "Confident_Infection_Classification",
+    "predicted.id",
+    "Donor"
+  )
+)
+
+### Count the number of cells per infection state per cell type
+Infection_by_predicted.id <- group_by(
+  Infection_by_predicted.id,
+  Confident_Infection_Classification,
+  predicted.id,
+  Donor
+) %>% tally()
+
+### Plot percent of infected cells derived from each cell type by donor
+Infection_Burden_By_Donor <- subset(Infection_by_predicted.id, Confident_Infection_Classification == "Infected") %>%
+  group_by(Donor) %>%
+  mutate(Total_Infected_Cells = sum(n)) %>%
+  mutate(Infection_Burden = n / Total_Infected_Cells)
+
+### Fill in empty values to make columns consistent size
+Infection_Burden_By_Donor <- right_join(Infection_Burden_By_Donor, tidyr::expand(Infection_Burden_By_Donor, Donor, predicted.id))
+
+### Remove duplicate rows
+Infection_Burden_By_Donor <- distinct(Infection_Burden_By_Donor)
+
+ggplot(Infection_Burden_By_Donor, aes(
+  x = Donor,
+  y = n,
+  fill = predicted.id
+)) +
+  geom_col(
+    position = "stack",
+    width = 0.75
+  ) +
+  scale_fill_manual(values = Cell_Type_Palette) +
+  labs(
+    y = "Number of Infected Cells",
+    fill = "Cell Type"
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "right"
+  )
+ggsave(
+  filename = here("analysis/figures/Figure_3C_Infected_Cell_Types.pdf"),
+  height = 2.875, width = 4.75
+)
+```
+## Scale RNA Slot for Downstream Figures
+```{r}
+Pancreas_BRR <- ScaleData(Pancreas_BRR,
+  assay = "RNA",
+  features = rownames(Pancreas_BRR@assays$RNA@counts)
+)
+
+DefaultAssay(Pancreas_BRR) <- "RNA"
+```
+# Prepare dot plot of markers of interest
+```{r}
+### Pull normalized marker gene expression data
+Selected_Markers_by_Cell_Type_Avg_Expression <- FetchData(Pancreas_BRR,
+  vars = c(
+    "DPP4", "TFRC", "NRP1",
+    "predicted.id",
+    "Sample"
+  ),
+  slot = "data",
+  cells = WhichCells(Pancreas_BRR,
+    expression = Condition == "Mock"
+  )
+)
+
+### Scale normalized gene expression by Donor across only beta cells
+Selected_Markers_by_Cell_Type_Avg_Expression[, c("DPP4", "TFRC", "NRP1")] <- Selected_Markers_by_Cell_Type_Avg_Expression %>%
+  group_by(Sample) %>%
+  mutate(across(.cols = c("DPP4", "TFRC", "NRP1"), .fns = scale))
+
+### Pivot Data to Combine Genes into one column
+Selected_Markers_by_Cell_Type_Avg_Expression <- pivot_longer(Selected_Markers_by_Cell_Type_Avg_Expression,
+  cols = c("DPP4", "TFRC", "NRP1"),
+  names_to = "Gene",
+  values_to = "Expression"
+)
+
+### Calculate average scaled expression per gene per celltype and per sample
+Selected_Markers_by_Cell_Type_Avg_Expression <- Selected_Markers_by_Cell_Type_Avg_Expression %>%
+  group_by(Sample, predicted.id, Gene) %>%
+  mutate(Avg_Expression = mean(Expression))
+
+### Simplify data
+Selected_Markers_by_Cell_Type_Avg_Expression <- Selected_Markers_by_Cell_Type_Avg_Expression %>%
+  dplyr::select(predicted.id, Sample, Gene, Avg_Expression) %>%
+  distinct()
+
+### Order marker genes
+Selected_Markers_by_Cell_Type_Avg_Expression$Gene <- factor(Selected_Markers_by_Cell_Type_Avg_Expression$Gene,
+  levels = c("DPP4", "TFRC", "NRP1")
+)
+
+### Use dotplot function to collect percent of cells expressing genes of interest
+Selected_Markers_by_Cell_Type <- DotPlot(Pancreas_BRR,
+  assay = "RNA",
+  features = c("DPP4", "TFRC", "NRP1"),
+  group.by = "predicted.id",
+  split.by = "Sample",
+  cols = rep.int(c("red", "yellow", "blue", "green"),
+    times = 12
+  )
+)
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type$data
+
+### Separate combined donor/celltype column
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type %>% separate(id, into = c("celltype1", "celltype2", "donor1", "donor2", "donor3"))
+
+### Format cell types columns
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type %>% unite(col = "Cell_Type", celltype1, celltype2, remove = FALSE)
+Selected_Markers_by_Cell_Type$Cell_Type <- str_remove(string = Selected_Markers_by_Cell_Type$Cell_Type, pattern = "_Infect") %>%
+  str_remove(pattern = "_Mock")
+
+### Format sample columns
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type %>% unite(col = "Sample", celltype2, donor1, donor2, donor3)
+Selected_Markers_by_Cell_Type$Sample <- str_remove_all(string = Selected_Markers_by_Cell_Type$Sample, pattern = "_NA") %>%
+  str_remove(pattern = "stellate_")
+
+### Set order of genes
+Selected_Markers_by_Cell_Type$features.plot <- factor(Selected_Markers_by_Cell_Type$features.plot,
+  levels = c("DPP4", "TFRC", "NRP1")
+)
+
+### Set order of celltypes
+Selected_Markers_by_Cell_Type$Cell_Type <- factor(Selected_Markers_by_Cell_Type$Cell_Type,
+  levels = c(
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "acinar",
+    "ductal",
+    "endothelial",
+    "activated_stellate",
+    "quiescent_stellate",
+    "mast",
+    "schwann",
+    "macrophage"
+  )
+)
+
+### Merge dataframes
+Cell_Type_Markers <- merge(
+  x = Selected_Markers_by_Cell_Type_Avg_Expression,
+  y = Selected_Markers_by_Cell_Type,
+  by.x = c("Gene", "predicted.id", "Sample"),
+  by.y = c("features.plot", "Cell_Type", "Sample")
+)
+
+### Change underscores for spaces
+Cell_Type_Markers$Sample <- str_replace_all(
+  string = Cell_Type_Markers$Sample,
+  pattern = "_",
+  replacement = " "
+)
+ggplot(
+  Cell_Type_Markers,
+  aes(
+    x = Gene,
+    y = Sample,
+    color = Avg_Expression,
+    size = pct.exp
+  )
+) +
+  geom_point() +
+  scale_color_paletteer_c(
+    palette = "grDevices::RdYlBu", direction = -1,
+    limits = c(-3, 3),
+    oob = scales::squish
+  ) +
+  scale_size_area(max_size = 3) +
+  scale_x_discrete(limits = rev) +
+  facet_grid(
+    cols = vars(predicted.id),
+    switch = "x"
+  ) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    color = "Average\nExpression",
+    size = "Percent\nExpressing"
+  ) +
+  coord_flip() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.placement = "outside",
+    strip.background = element_blank()
+  )
+ggsave(
+  filename = here("analysis/figures/Figure_S7D_Selected_Markers_dotplot.pdf"),
+  height = 4, width = 8
+)
+```
+
+# Prepare a list of RNA markers of cell types
+```{r}
+### Determine cell types with at least 3 cells in each sample
+cells_per_donor <- FetchData(Pancreas_BRR,
+  vars = c(
+    "predicted.id",
+    "Sample"
+  )
+)
+
+### Count the number of cells per cell type per sample
+cells_per_donor <- cells_per_donor %>%
+  group_by(predicted.id, Sample) %>%
+  tally()
+
+### Remove celltypes with less than 3 cells per sample
+cells_per_donor <- subset(cells_per_donor, n >= 3)
+
+### Reorganize data
+cells_per_donor <- cells_per_donor %>% pivot_wider(names_from = Sample, values_from = n)
+
+### Subset to only cell types with 3 cells in all samples
+cells_per_donor <- cells_per_donor[complete.cases(cells_per_donor), ]
+
+### Prepare a vector of cell types to test
+celltypes_to_test <- cells_per_donor$predicted.id
+
+### Set identity for seurat object to predicted cell type
+Idents(Pancreas_BRR) <- Pancreas_BRR$predicted.id
+
+### Increase available memory for find conserved markers
+options(future.globals.maxSize = 4 * 1024^3)
+
+### Set to sequential computation
+plan(strategy = "sequential")
+rm(list = c(
+  "pancreas_dgelist",
+  "pairwise_de_results",
+  "pancreas_sce",
+  "Infected_Only",
+  "heatmap_mat",
+  "Data_for_DE_Testing",
+  "Significant_GO_Results",
+  "GO_Results",
+  "significant_pancreas_dge_list"
+))
+
+### Determine cell type markers
+Cell_Type_Markers <- lapply(
+  X = celltypes_to_test,
+  FUN = function(x) {
+    #### Subset to cell types with at least 3 cells per donor
+    #### Find markers conserved within cell type compared to all other cell types across samples
+    output <- FindConservedMarkers(
+      object = Pancreas_BRR,
+      ident.1 = x,
+      grouping.var = "Sample"
+    )
+    return(output)
+  }
+)
+
+### Name marker output
+names(Cell_Type_Markers) <- celltypes_to_test
+
+### Add genes to marker output
+Cell_Type_Markers <- lapply(Cell_Type_Markers, function(x) {
+  x$Gene <- rownames(x)
+  return(x)
+})
+
+### Reorder marker columns so gene is first column
+Cell_Type_Markers <- lapply(Cell_Type_Markers, function(x) {
+  x <- x[, c("Gene", colnames(x)[1:ncol(x) - 1])]
+  return(x)
+})
+
+### Subset to markes with maximum p value less than 0.05
+Cell_Type_Markers <- lapply(Cell_Type_Markers, subset, max_pval < 0.05)
+
+### Write marker output to excel sheet
+write.xlsx(Cell_Type_Markers,
+  file = here("analysis/data/derived_data/Table_S2_cell_type_markers.xlsx"),
+  overwrite = TRUE
+)
+```
+## Visualize Marker Expression by Cell Type
+```{r}
+### Prepare a list of marker genes
+Marker_Genes <- c(
+  ### Alpha
+  "GCG", "PCSK2", "TTR",
+  ### Beta
+  "INS", "IAPP", "ADCYAP1",
+  ### Gamma
+  "PPY", "ETV1",
+  ### Delta
+  "SST", "RBP4",
+  ### Acinar
+  "PRSS1", "REG1A", "SPINK1",
+  ### Ductal
+  "KRT19", "CFTR",
+  ### Endothelial
+  "PLVAP", "PECAM1", "KDR",
+  ### Activated stellate
+  "PDGFRB", "COL1A2",
+  ### Macrophage
+  "TYROBP", "SDS"
+)
+
+### Pull normalized marker gene expression data
+Selected_Markers_by_Cell_Type_Avg_Expression <- FetchData(Pancreas_BRR,
+  vars = c(
+    Marker_Genes,
+    "predicted.id",
+    "Sample"
+  ),
+  slot = "data",
+  cells = WhichCells(Pancreas_BRR,
+    expression = predicted.id %in% celltypes_to_test
+  )
+)
+
+### Scale normalized gene expression by Donor across only beta cells
+Selected_Markers_by_Cell_Type_Avg_Expression[, Marker_Genes] <- Selected_Markers_by_Cell_Type_Avg_Expression %>%
+  group_by(Sample) %>%
+  mutate(across(.cols = Marker_Genes, .fns = scale))
+
+### Pivot Data to Combine Genes into one column
+Selected_Markers_by_Cell_Type_Avg_Expression <- pivot_longer(Selected_Markers_by_Cell_Type_Avg_Expression,
+  cols = Marker_Genes,
+  names_to = "Gene",
+  values_to = "Expression"
+)
+
+### Calculate average scaled expression per gene per celltype and per sample
+Selected_Markers_by_Cell_Type_Avg_Expression <- Selected_Markers_by_Cell_Type_Avg_Expression %>%
+  group_by(Sample, predicted.id, Gene) %>%
+  mutate(Avg_Expression = mean(Expression))
+
+### Simplify data
+Selected_Markers_by_Cell_Type_Avg_Expression <- Selected_Markers_by_Cell_Type_Avg_Expression %>%
+  dplyr::select(predicted.id, Sample, Gene, Avg_Expression) %>%
+  distinct()
+
+### Order marker genes
+Selected_Markers_by_Cell_Type_Avg_Expression$Gene <- factor(Selected_Markers_by_Cell_Type_Avg_Expression$Gene,
+  levels = Marker_Genes
+)
+
+### Use dotplot function to collect percent of cells expressing genes of interest
+Selected_Markers_by_Cell_Type <- DotPlot(Pancreas_BRR,
+  assay = "RNA",
+  features = Marker_Genes,
+  group.by = "predicted.id",
+  split.by = "Sample",
+  cols = rep.int(c("red", "yellow", "blue", "green"),
+    times = 12
+  )
+)
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type$data
+
+### Separate combined donor/celltype column
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type %>% separate(id, into = c("celltype1", "celltype2", "donor1", "donor2", "donor3"))
+
+### Format cell types columns
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type %>% unite(col = "Cell_Type", celltype1, celltype2, remove = FALSE)
+Selected_Markers_by_Cell_Type$Cell_Type <- str_remove(string = Selected_Markers_by_Cell_Type$Cell_Type, pattern = "_Infect") %>%
+  str_remove(pattern = "_Mock")
+
+### Format sample columns
+Selected_Markers_by_Cell_Type <- Selected_Markers_by_Cell_Type %>% unite(col = "Sample", celltype2, donor1, donor2, donor3)
+Selected_Markers_by_Cell_Type$Sample <- str_remove_all(string = Selected_Markers_by_Cell_Type$Sample, pattern = "_NA") %>%
+  str_remove(pattern = "stellate_")
+
+### Set order of genes
+Selected_Markers_by_Cell_Type$features.plot <- factor(Selected_Markers_by_Cell_Type$features.plot,
+  levels = Marker_Genes
+)
+
+### Set order of celltypes
+Selected_Markers_by_Cell_Type$Cell_Type <- factor(Selected_Markers_by_Cell_Type$Cell_Type,
+  levels = c(
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "acinar",
+    "ductal",
+    "endothelial",
+    "activated_stellate",
+    "quiescent_stellate",
+    "mast",
+    "schwann",
+    "macrophage"
+  )
+)
+
+### Merge dataframes
+Cell_Type_Markers <- merge(
+  x = Selected_Markers_by_Cell_Type_Avg_Expression,
+  y = Selected_Markers_by_Cell_Type,
+  by.x = c("Gene", "predicted.id", "Sample"),
+  by.y = c("features.plot", "Cell_Type", "Sample")
+)
+
+### Change underscores for spaces
+Cell_Type_Markers$Sample <- str_replace_all(
+  string = Cell_Type_Markers$Sample,
+  pattern = "_",
+  replacement = " "
+)
+ggplot(
+  Cell_Type_Markers,
+  aes(
+    x = Gene,
+    y = Sample,
+    color = Avg_Expression,
+    size = pct.exp
+  )
+) +
+  geom_point() +
+  scale_color_paletteer_c(
+    palette = "grDevices::RdYlBu", direction = -1,
+    limits = c(-3, 3),
+    oob = scales::squish
+  ) +
+  scale_size_area(max_size = 3) +
+  scale_y_discrete(limits = rev) +
+  facet_grid(
+    rows = vars(predicted.id),
+    switch = "y"
+  ) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    color = "Average\nExpression",
+    size = "Percent_Expressing"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.placement = "outside",
+    strip.background = element_blank()
+  )
+ggsave(
+  filename = here("analysis/figures/Figure_S4A_Marker_Gene_Expression.pdf"),
+  height = 8.25, width = 8
+)
+```
+
+## Test for ISG Signatures Per Cell Type by Infection Status
+```{r}
+### Download Hallmark ISGs from msigdb
+Type_I_IFN <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  subset(gs_name == "HALLMARK_INTERFERON_ALPHA_RESPONSE") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+Type_II_IFN <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  subset(gs_name == "HALLMARK_INTERFERON_GAMMA_RESPONSE") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+Inflammatory <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  subset(gs_name == "HALLMARK_INFLAMMATORY_RESPONSE") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+TNF_NFKB <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  subset(gs_name == "HALLMARK_TNFA_SIGNALING_VIA_NFKB") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+### Add ISG Module scores to Seurat object
+Pancreas_BRR <- AddModuleScore(Pancreas_BRR,
+  features = list(Type_I_IFN),
+  assay = "RNA",
+  name = "Interferon_Alpha_Response"
+)
+Pancreas_BRR <- AddModuleScore(Pancreas_BRR,
+  features = list(Type_II_IFN),
+  assay = "RNA",
+  name = "Interferon_Gamma_Response"
+)
+Pancreas_BRR <- AddModuleScore(Pancreas_BRR,
+  features = list(Inflammatory),
+  assay = "RNA",
+  name = "Inflammatory_Response"
+)
+Pancreas_BRR <- AddModuleScore(Pancreas_BRR,
+  features = list(TNF_NFKB),
+  assay = "RNA",
+  name = "TNFa_Signaling_via_NFkB"
+)
+
+### Plot ISG scores with violin plots
+Inflammation_Gene_Scores <- FetchData(Pancreas_BRR,
+  vars = c(
+    "Interferon_Alpha_Response1",
+    "Interferon_Gamma_Response1",
+                                                                                                                                                                                             "Inflammatory_Response1",
+    "TNFa_Signaling_via_NFkB1",
+    "percent_viral",
+    "Donor",
+    "Confident_Infection_Classification"
+  )
+)
+
+### Reformat Donor name
+Inflammation_Gene_Scores$Donor <- str_replace(
+  string = Inflammation_Gene_Scores$Donor,
+  pattern = "_",
+  replacement = " "
+)
+
+### Set order for infection states
+Inflammation_Gene_Scores$Confident_Infection_Classification <- factor(Inflammation_Gene_Scores$Confident_Infection_Classification,
+  levels = c("Mock", "Bystander", "Not Assigned", "Infected")
+)
+
+### Remove Not Assigned cells
+Inflammation_Gene_Scores <- subset(
+  Inflammation_Gene_Scores,
+  Confident_Infection_Classification != "Not Assigned"
+)
+
+### Reformat percent viral
+Inflammation_Gene_Scores$percent_viral <- 0.01 * Inflammation_Gene_Scores$percent_viral
+
+### Plot gene set scores per cell
+plot_1 <- ggplot(
+  Inflammation_Gene_Scores,
+  aes(
+    x = Confident_Infection_Classification,
+    y = Interferon_Alpha_Response1,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA, size = 0.1) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = "Interferon Alpha Response"
+  ) +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0, size = 8, face = "bold"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 8, face = "plain")
+  )
+plot_2 <- ggplot(
+  Inflammation_Gene_Scores,
+  aes(
+    x = Confident_Infection_Classification,
+    y = Interferon_Gamma_Response1,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA, size = 0.1) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = "Interferon Gamma Response"
+  ) +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0, size = 8, face = "bold"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_blank()
+  )
+plot_3 <- ggplot(
+  Inflammation_Gene_Scores,
+  aes(
+    x = Confident_Infection_Classification,
+    y = Inflammatory_Response1,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA, size = 0.1) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = "Inflammatory Response"
+  ) +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0, size = 8, face = "bold"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_blank()
+  )
+plot_4 <- ggplot(
+  Inflammation_Gene_Scores,
+  aes(
+    x = Confident_Infection_Classification,
+    y = TNFa_Signaling_via_NFkB1,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA, size = 0.1) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = "TNFa Signaling via NFkB"
+  ) +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0, size = 8, face = "bold"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_blank()
+  )
+plot_5 <- ggplot(
+  Inflammation_Gene_Scores,
+  aes(
+    x = Confident_Infection_Classification,
+    y = percent_viral,
+    fill = Confident_Infection_Classification
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA, size = 0.1) +
+  stat_ydensity(trim = TRUE, scale = "width", na.rm = FALSE, orientation = NA, adjust = 1) +
+  scale_fill_manual(values = Infection_State_Palette) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_grid(cols = vars(Donor)) +
+  theme_classic() +
+  labs(
+    x = element_blank(),
+    y = element_blank(),
+    title = "Percent Viral Gene Expression per Cell"
+  ) +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(hjust = 0, size = 8, face = "bold"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_blank()
+  )
+
+plot_1 /
+  plot_2 /
+  plot_3 /
+  plot_4 /
+  plot_5 +
+  plot_layout(guides = "collect")
+ggsave(
+  filename = here("analysis/figures/Figure_S4B_Inflammatory_Signatures.pdf"),
+  height = 8, width = 4
+)
+```
+
+# Viral Gene Expression by Infection Status
+```{r}
+Cells_Per_Sample <- FetchData(Pancreas_BRR,
+  vars = c(
+    "Confident_Infection_Classification",
+    "Sample"
+  )
+)
+
+Cells_Per_Sample$Cell_BC <- rownames(Cells_Per_Sample)
+Cells_Per_Sample$State <- paste(Cells_Per_Sample$Confident_Infection_Classification,
+  Cells_Per_Sample$Sample,
+  sep = "_"
+)
+Cells_Per_Sample <- Cells_Per_Sample %>%
+  group_by(Confident_Infection_Classification, State) %>%
+  slice_sample(n = 100)
+Cells_Per_Sample <- Cells_Per_Sample$Cell_BC
+
+Viral_Genes_Data <- FetchData(Pancreas_BRR,
+  vars = c(
+    viral_genes,
+    "predicted.id",
+    "Confident_Infection_Classification",
+    "Sample"
+  ),
+  cells = Cells_Per_Sample,
+  slot = "scale.data"
+)
+
+
+heatmap_mat <- Viral_Genes_Data[, viral_genes]
+ann_columns <- Viral_Genes_Data[, !colnames(Viral_Genes_Data) %in% viral_genes]
+heatmap_mat <- t(heatmap_mat)
+
+### Prepare color palettes for heatmap
+annotation_colors <- annotation_colors <- list(
+  Confident_Infection_Classification = Infection_State_Palette,
+  Sample = Sample_Palette,
+  predicted.id = Cell_Type_Palette
+)
+
+### Plot heatmap with ward d2 clustering of genes and cells based on pearson correlation
+pdf(
+  file = here("analysis/figures/Supplement_2_A_Viral_Gene_Expression_by_Status.pdf"),
+  width = 4, height = 4
+)
+pheatmap(heatmap_mat,
+  annotation_col = ann_columns,
+  cluster_rows = FALSE,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "ward.D2",
+  annotation_colors = annotation_colors,
+  cluster_cols = TRUE,
+  scale = "none",
+  color = paletteer_c(palette = "viridis::magma", n = 1000, direction = 1),
+  show_colnames = FALSE
+)
+dev.off()
+
+### Plot heatmap without rownames
+pdf(
+  file = here("analysis/figures/Supplement_2_A_Viral_Gene_Expression_by_Status_nolabel.pdf"),
+  width = 4, height = 4
+)
+pheatmap(heatmap_mat,
+  annotation_col = ann_columns,
+  cluster_rows = FALSE,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "ward.D2",
+  annotation_colors = annotation_colors,
+  cluster_cols = TRUE,
+  scale = "none",
+  color = paletteer_c(palette = "viridis::magma", n = 1000, direction = 1),
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  legend = FALSE,
+  annotation_legend = FALSE
+)
+dev.off()
+```
+
+## Use FindConservedMarkers to identify DE genes
+```{r}
+### Pull data to determine infected cell types
+infected_cell_types <- FetchData(Pancreas_BRR,
+  vars = c(
+    "predicted.id",
+    "Sample",
+    "Confident_Infection_Classification"
+  )
+)
+
+### Count number of infected cell types per sample per cell type
+infected_cell_types <- infected_cell_types %>%
+  subset(Confident_Infection_Classification == "Infected") %>%
+  group_by(predicted.id, Sample, Confident_Infection_Classification) %>%
+  tally()
+
+### Subset data to cell types with at least 20 infected cells per sample
+infected_cell_types <- subset(infected_cell_types, n >= 20)
+
+### Rearrange data
+infected_cell_types <- infected_cell_types %>% pivot_wider(names_from = Sample, values_from = n)
+
+### Select only cell types infected in both Infect_2 and Infect_3 samples
+infected_cell_types <- infected_cell_types[complete.cases(infected_cell_types), ]
+
+### Collect cell types
+infected_cell_types <- infected_cell_types$predicted.id
+
+### Perform differential expression testing between infected, bystander, and mock cells per cell type
+DE_Genes <- lapply(infected_cell_types, function(celltype) {
+  ### Subset data to cell type of interest
+  Seurat_object_for_testing <- subset(
+    Pancreas_BRR,
+    predicted.id == celltype
+  )
+
+  ### Remove infected Donor 1 cells (because there are too few for analysis)
+  Seurat_object_for_testing <- subset(Seurat_object_for_testing,
+    Donor == "Donor_1" & Confident_Infection_Classification == "Infected",
+    invert = TRUE
+  )
+
+  ### Set the identify of the Seurat object to infection classification
+  Idents(Seurat_object_for_testing) <- "Confident_Infection_Classification"
+
+  ### Perform DE testing
+  output <- list(
+
+    ### Compared infected and mock cells per donor in cell type of interest
+    Infected_Mock = FindConservedMarkers(
+      object = Seurat_object_for_testing,
+      ident.1 = "Infected",
+      ident.2 = "Mock",
+      grouping.var = "Donor",
+      assay = "RNA",
+      verbose = FALSE,
+      features = host_genes
+    ),
+
+    ### Compared infected and bystander cells per donor in cell type of interest
+    Infected_Bystander = FindConservedMarkers(
+      object = Seurat_object_for_testing,
+      ident.1 = "Infected",
+      ident.2 = "Bystander",
+      grouping.var = "Donor",
+      assay = "RNA",
+      verbose = FALSE,
+      features = host_genes
+    ),
+
+    ### Compared bystander and mock cells per donor in cell type of interest
+    Bystander_Mock = FindConservedMarkers(
+      object = Seurat_object_for_testing,
+      ident.1 = "Bystander",
+      ident.2 = "Mock",
+      grouping.var = "Donor",
+      assay = "RNA",
+      verbose = FALSE,
+      features = host_genes
+    )
+  )
+  return(output)
+})
+### Add names to differential expressin output
+names(DE_Genes) <- infected_cell_types
+```
+
+### Visualize DE genes per donor per cell type per infection state
+```{r}
+### Subset genes with adjusted p value less than 0.01 & log2FC > log2(1.5)
+significant_DE_genes <- list(
+  alpha = lapply(
+    DE_Genes$alpha, subset,
+    (Donor_2_p_val_adj < 0.01 & abs(Donor_2_avg_log2FC) > log2(1.5)) |
+      (Donor_3_p_val_adj < 0.01 & abs(Donor_3_avg_log2FC) > log2(1.5))
+  ),
+  beta = lapply(
+    DE_Genes$beta, subset,
+    (Donor_2_p_val_adj < 0.01 & abs(Donor_2_avg_log2FC) > log2(1.5)) |
+      (Donor_3_p_val_adj < 0.01 & abs(Donor_3_avg_log2FC) > log2(1.5))
+  )
+)
+significant_DE_genes$alpha$Bystander_Mock <- subset(
+  significant_DE_genes$alpha$Bystander_Mock,
+  (Donor_1_p_val_adj < 0.01 & abs(Donor_1_avg_log2FC) > log2(1.5)) |
+    (Donor_2_p_val_adj < 0.01 & abs(Donor_2_avg_log2FC) > log2(1.5)) |
+    (Donor_3_p_val_adj < 0.01 & abs(Donor_3_avg_log2FC) > log2(1.5))
+)
+
+significant_DE_genes$beta$Bystander_Mock <- subset(
+  significant_DE_genes$beta$Bystander_Mock,
+  (Donor_1_p_val_adj < 0.01 & abs(Donor_1_avg_log2FC) > log2(1.5)) |
+    (Donor_2_p_val_adj < 0.01 & abs(Donor_2_avg_log2FC) > log2(1.5)) |
+    (Donor_3_p_val_adj < 0.01 & abs(Donor_3_avg_log2FC) > log2(1.5))
+)
+
+### Collect genes that are significantly differentially expressed
+genes_of_interest <- list(
+  alpha = lapply(significant_DE_genes$alpha, rownames),
+  beta = lapply(significant_DE_genes$beta, rownames)
+)
+
+### Collect unique genes into a vector per cell type
+genes_of_interest <- lapply(genes_of_interest, Reduce, f = unique)
+
+### Write de results output to excel sheet
+write.xlsx(significant_DE_genes$alpha,
+  file = here("analysis/data/derived_data/Table_S3_differential_expression_alpha_results.xlsx"),
+  overwrite = TRUE,
+  rowNames = TRUE
+)
+
+write.xlsx(significant_DE_genes$beta,
+  file = here("analysis/data/derived_data/Table_S4_differential_expression_beta_results.xlsx"),
+  overwrite = TRUE,
+  rowNames = TRUE
+)
+
+### Use DotPlot function to calculate percent of cells expressing gene of interest
+beta_dotplot <- DotPlot(Pancreas_BRR,
+  assay = "RNA",
+  features = genes_of_interest$beta,
+  group.by = "Donor",
+  split.by = "Confident_Infection_Classification",
+  cols = rep.int("red", times = 100)
+)
+
+### Pull data from plot output
+beta_dotplot <- beta_dotplot$data
+
+### Separate Donor from Infection Classification in id column
+beta_dotplot <- beta_dotplot %>% separate(id, into = c(NA, "Donor", "Infection_Classification"))
+
+### Format Donor column
+beta_dotplot$Donor <- paste("Donor", beta_dotplot$Donor, sep = "_")
+
+### Remove cells without assigned infection state
+beta_dotplot <- subset(beta_dotplot, Infection_Classification != "Not Assigned")
+
+### Pull normalized expression for genes of interest for beta cells
+beta_genes <- FetchData(Pancreas_BRR,
+  vars = c(
+    genes_of_interest$beta,
+    "Donor",
+    "Confident_Infection_Classification"
+  ),
+  cells = WhichCells(Pancreas_BRR,
+    expression = predicted.id == "beta"
+  ),
+  slot = "data"
+)
+
+### Scale normalized gene expression by Donor across only beta cells
+beta_genes[, genes_of_interest$beta] <- beta_genes %>%
+  group_by(Donor) %>%
+  mutate(across(
+    .cols = genes_of_interest$beta,
+    .fns = scale
+  ))
+
+### Calculate the average of the scaled expression values per donor per infection classification per gene
+beta_genes <- beta_genes %>%
+  pivot_longer(cols = genes_of_interest$beta, names_to = "Gene", values_to = "Scaled_Expression") %>%
+  group_by(Donor, Confident_Infection_Classification, Gene) %>%
+  mutate(Avg_Scaled_Expression = mean(Scaled_Expression)) %>%
+  dplyr::select(Donor, Confident_Infection_Classification, Gene, Avg_Scaled_Expression) %>%
+  distinct() %>%
+  subset(Confident_Infection_Classification != "Not Assigned")
+
+### Merge dotplot data containing percent expression with average scaled expression value data
+beta_dotplot_merged <- merge(
+  x = beta_genes,
+  y = beta_dotplot,
+  by.x = c("Donor", "Confident_Infection_Classification", "Gene"),
+  by.y = c("Donor", "Infection_Classification", "features.plot")
+)
+
+### Reformat donor name
+beta_dotplot_merged$Donor <- str_replace(
+  string = beta_dotplot_merged$Donor,
+  pattern = "_",
+  replacement = " "
+)
+
+### Reformat average scaled expression data
+beta_genes <- beta_genes %>% pivot_wider(names_from = Gene, values_from = Avg_Scaled_Expression)
+
+### Cluster gene expression
+gene_clusters <- hclust(dist(t(beta_genes[, genes_of_interest$beta]), method = "euclidean"), method = "ward.D2")
+
+### Order genes according to their cluster
+gene_clusters_order <- gene_clusters$order
+gene_clusters_order <- genes_of_interest$beta[gene_clusters_order]
+beta_dotplot_merged$Gene <- factor(beta_dotplot_merged$Gene,
+  levels = gene_clusters_order
+)
+
+### Select genes in k = 3 clusters
+gene_clusters <- cutree(gene_clusters, k = 4)
+
+### Add gene cluster to data
+beta_dotplot_merged$Gene_Cluster <- gene_clusters[match(beta_dotplot_merged$Gene, names(gene_clusters))]
+
+### Remove Donor_1 Infected Cell Data
+beta_dotplot_merged <- subset(beta_dotplot_merged, !(Donor == "Donor_1" & Confident_Infection_Classification == "Infected"))
+
+### Create dummy data to block out Donor 1 Infected data
+fill_empty_block <- beta_dotplot_merged[, c(
+  "Gene",
+  "Donor",
+  "Confident_Infection_Classification",
+  "Gene_Cluster"
+)]
+fill_empty_block$Donor <- "Donor 1"
+fill_empty_block$Confident_Infection_Classification <- "Infected"
+
+### Set levels for infection classification
+fill_empty_block$Confident_Infection_Classification <- factor(fill_empty_block$Confident_Infection_Classification,
+  levels = c("Mock", "Bystander", "Infected")
+)
+beta_dotplot_merged$Confident_Infection_Classification <- factor(beta_dotplot_merged$Confident_Infection_Classification,
+  levels = c("Mock", "Bystander", "Infected")
+)
+
+beta_dotplot_merged$IFNa_Response <- ifelse(beta_dotplot_merged$Gene %in% Type_I_IFN,
+  TRUE, FALSE
+)
+beta_dotplot_merged$IFNg_Response <- ifelse(beta_dotplot_merged$Gene %in% Type_II_IFN,
+  TRUE, FALSE
+)
+beta_dotplot_merged$Inflammatory_Response <- ifelse(beta_dotplot_merged$Gene %in% Inflammatory,
+  TRUE, FALSE
+)
+beta_dotplot_merged$TNFa_NFkB_Signaling <- ifelse(beta_dotplot_merged$Gene %in% TNF_NFKB,
+  TRUE, FALSE
+)
+
+### Remove Donor_1 Infected Cells
+beta_dotplot_merged <- subset(
+  beta_dotplot_merged,
+  !(Donor == "Donor 1" & Confident_Infection_Classification == "Infected")
+)
+
+### Make Dot Plot
+dotplot <- ggplot() +
+  geom_point(
+    data = beta_dotplot_merged,
+    aes(
+      x = Gene,
+      y = Donor,
+      size = pct.exp,
+      color = Avg_Scaled_Expression
+    )
+  ) +
+  geom_point(
+    data = fill_empty_block,
+    aes(
+      x = Gene,
+      y = Donor
+    ),
+    shape = 21,
+    fill = "grey90",
+    size = 0.1
+  ) +
+  scale_y_discrete(limits = rev) +
+  scale_size_area(max_size = 4.5) +
+  theme_classic() +
+  scale_color_paletteer_c("grDevices::RdYlBu",
+    direction = -1,
+    limits = c(-1, 1),
+    oob = scales::squish
+  ) +
+  facet_grid(
+    rows = vars(Confident_Infection_Classification),
+    cols = vars(Gene_Cluster),
+    switch = "y",
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  labs(
+    y = element_blank(),
+    x = element_blank(),
+    size = "Percent\nExpressing",
+    color = "Average\nScaled\nExpression"
+  ) +
+  theme(
+    legend.position = "bottom",
+    axis.text = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text.x = element_blank(),
+    strip.background.x = element_blank(),
+    strip.placement = "outside"
+  )
+```
+
+#### Plot gene presence in modules of interest
+```{r}
+### Prepare data on genes in modules of interest
+gene_sets <- beta_dotplot_merged %>%
+  pivot_longer(
+    cols = c(IFNa_Response, IFNg_Response, Inflammatory_Response, TNFa_NFkB_Signaling),
+    names_to = "Module",
+    values_to = "Gene_in_Module"
+  ) %>%
+  dplyr::select(Gene, Module, Gene_in_Module, Gene_Cluster) %>%
+  distinct()
+gene_sets$Gene <- factor(gene_sets$Gene,
+  levels = gene_clusters_order
+)
+### Make plot of gene modules
+modules_plot <- ggplot() +
+  geom_tile(
+    data = gene_sets,
+    mapping = aes(
+      x = Gene,
+      y = Module,
+      color = Gene_in_Module,
+      alpha = Gene_in_Module
+    ),
+    fill = "black"
+  ) +
+  scale_color_manual(values = c("transparent", "white")) +
+  scale_alpha_manual(values = c(0, 1)) +
+  facet_grid(
+    cols = vars(Gene_Cluster),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  scale_y_discrete(
+    limits = rev,
+    labels = c(
+      IFNa_Response = "Interferon Alpha Response",
+      IFNg_Response = "Interferon Gamma Response",
+      Inflammatory_Response = "Inflammatory Response",
+      TNFa_NFkB_Signaling = "TNFa Signaling via NFkB"
+    )
+  ) +
+  theme_classic() +
+  labs(
+    y = element_blank(),
+    x = element_blank()
+  ) +
+  theme(
+    text = element_text(
+      size = 6,
+    ),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "none",
+    strip.text.x = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+#### Plot Infection Information
+```{r}
+### Prepare Data for Infection Plot
+beta_infection <- FetchData(Pancreas_BRR,
+  vars = c(
+    "percent_viral",
+    "Donor",
+    "Confident_Infection_Classification"
+  ),
+  cells = WhichCells(Pancreas_BRR,
+    expression = predicted.id == "beta"
+  )
+)
+### Calculate Average Percent Viral Gene Expression & Percent of Beta Cells Infected for beta cells
+beta_infection <- beta_infection %>%
+  group_by(Donor, Confident_Infection_Classification) %>%
+  add_tally(name = "nCells_per_Infection_State") %>%
+  group_by(Donor) %>%
+  add_tally(name = "nCells_per_Donor") %>%
+  mutate(Percent_Cells_per_Infection_State = nCells_per_Infection_State / nCells_per_Donor) %>%
+  subset(Confident_Infection_Classification != "Not Assigned") %>%
+  distinct()
+
+### Format Percent Infected Cells
+beta_infection$Percent_Cells_per_Infection_State <- scales::percent(beta_infection$Percent_Cells_per_Infection_State, accuracy = 0.1)
+
+### Set values to NA for non-infected samples
+beta_infection$Percent_Cells_per_Infection_State <- ifelse(beta_infection$Confident_Infection_Classification == "Infected", beta_infection$Percent_Cells_per_Infection_State, NA)
+
+### Reformat Donor value
+beta_infection$Donor <- str_replace(
+  string = beta_infection$Donor,
+  pattern = "_",
+  replacement = " "
+)
+
+infection_plot <- ggplot(
+  beta_infection,
+  aes(
+    y = Donor,
+    x = percent_viral,
+    fill = Donor,
+    label = Percent_Cells_per_Infection_State
+  )
+) +
+  geom_violin(scale = "width", draw_quantiles = NULL, na.rm = FALSE, orientation = NA) +
+  stat_ydensity(trim = TRUE, scale = "width", adjust = 1) +
+  scale_fill_manual(values = as.character(Donor_Palette)) +
+  geom_text(
+    data = subset(beta_infection, Confident_Infection_Classification == "Infected") %>% dplyr::select(Donor, Confident_Infection_Classification, Percent_Cells_per_Infection_State) %>% distinct(),
+    x = 80
+  ) +
+  annotate(
+    x = 65,
+    y = 3.5,
+    label = "Percent of Beta Cells Infected",
+    geom = "text"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 80),
+    expand = c(0.05, 0.05)
+  ) +
+  scale_y_discrete(limits = rev) +
+  facet_grid(
+    rows = vars(Confident_Infection_Classification),
+    switch = "y"
+  ) +
+  theme_classic() +
+  labs(
+    y = element_blank(),
+    x = "Percent Viral Gene Expression"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 6),
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "none"
+  )
+```
+
+```{r}
+design <- "
+AAAAAAAC
+AAAAAAAC
+AAAAAAAC
+AAAAAAAC
+BBBBBBB#
+"
+
+dotplot + modules_plot + infection_plot +
+  plot_layout(design = design)
+ggsave(
+  filename = here("analysis/figures/Figure_3D_DE_gene_dotplot.pdf"),
+  height = 4.25, width = 8
+)
+```
+
+### Colophon
+
+This report was generated on `r Sys.time()` using the following computational environment and dependencies: 
+
+```{r colophon, cache = FALSE}
+# which R packages and versions?
+if ("devtools" %in% installed.packages()) devtools::session_info()
+```
+
+The current Git commit details are:
+
+```{r}
+# what commit is this file at?
+if ("git2r" %in% installed.packages() & git2r::in_repository(path = ".")) git2r::repository(here::here())
+```
