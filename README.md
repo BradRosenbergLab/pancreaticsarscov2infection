@@ -26,7 +26,7 @@ Our pre-print is online here:
 > <http://dx.doi.org/10.2139/ssrn.3945929>
 
 The code included in analysis/paper/paper.Rmd recreates figures involved
-in the single-cell RNA sequencing (scRNAseq) analysis fo van der Heide
+in the single-cell RNA sequencing (scRNAseq) analysis for van der Heide
 et al, Cell Reports 2022. In this work, we annotated human pancreatic
 islets infected or mock infected with SARS-CoV-2. We identified infected
 cell types including alpha and beta cells and explored genes
