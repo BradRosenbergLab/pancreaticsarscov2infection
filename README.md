@@ -42,5 +42,5 @@ Cell
 2020](https://www.cell.com/cell/fulltext/S0092-8674(20)30406-2?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS0092867420304062%3Fshowall%3Dtrue#secsectitle0035)
 with modifications to reduce redundancy as detailed in our manuscript.
 
-Research compendium git repository based in part on [the rrools
+Research compendium git repository based in part on [the rrtools
 package.](https://github.com/benmarwick/rrtools)
